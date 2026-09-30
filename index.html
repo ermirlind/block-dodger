@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#05050b">
+<title>Block Dodger</title>
+<style>
+  :root { --u: 1px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    background: #05050b;
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  #wrap {
+    position: relative;
+    overflow: hidden;
+    border-radius: calc(var(--u) * 8);
+    box-shadow: 0 0 calc(var(--u) * 40) rgba(34, 240, 255, 0.18), 0 0 0 1px rgba(34, 240, 255, 0.15);
+  }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; cursor: default; }
+  .btn {
+    position: absolute;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 1px solid rgba(34, 240, 255, 0.45);
+    background: rgba(10, 14, 32, 0.65);
+    color: #bff8ff;
+    border-radius: calc(var(--u) * 10);
+    cursor: pointer;
+    touch-action: none;
+    outline: none;
+    transition: background 0.12s, opacity 0.12s, box-shadow 0.12s;
+  }
+  .btn:hover { box-shadow: 0 0 calc(var(--u) * 12) rgba(34, 240, 255, 0.45); }
+  .btn svg { width: 55%; height: 55%; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+  #muteBtn, #pauseBtn { top: calc(var(--u) * 8); width: calc(var(--u) * 40); height: calc(var(--u) * 40); }
+  #pauseBtn { right: calc(var(--u) * 10); }
+  #muteBtn { right: calc(var(--u) * 58); }
+  #pauseBtn.hidden { display: none; }
+  #leftBtn, #rightBtn {
+    display: none;
+    bottom: calc(var(--u) * 10);
+    width: calc(var(--u) * 130);
+    height: calc(var(--u) * 70);
+    opacity: 0.5;
+    border-radius: calc(var(--u) * 16);
+  }
+  #leftBtn { left: calc(var(--u) * 10); }
+  #rightBtn { right: calc(var(--u) * 10); }
+  #wrap.touch #leftBtn, #wrap.touch #rightBtn { display: flex; }
+  .btn.active { background: rgba(34, 240, 255, 0.28); opacity: 0.95; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game"></canvas>
+  <button id="muteBtn" class="btn" tabindex="-1" aria-label="Toggle sound"></button>
+  <button id="pauseBtn" class="btn hidden" tabindex="-1" aria-label="Pause"></button>
+  <button id="leftBtn" class="btn" tabindex="-1" aria-label="Move left">
+    <svg viewBox="0 0 24 24"><path d="M15 5 L8 12 L15 19"/></svg>
+  </button>
+  <button id="rightBtn" class="btn" tabindex="-1" aria-label="Move right">
+    <svg viewBox="0 0 24 24"><path d="M9 5 L16 12 L9 19"/></svg>
+  </button>
+</div>
+
+<script>
+'use strict';
+
+/* =========================================================================
+   CONFIG & CONSTANTS
+   The game runs in a fixed logical world (W x H) that is scaled to fit the
+   window, so gameplay is identical on every screen size.
+   ========================================================================= */
+const W = 600;
+const H = 800;
+const HUD_H = 56;                // height of the top HUD bar
+const FLOOR_Y = H - 90;          // top of the floor strip (touch buttons live below it)
+const PLAYER_SIZE = 36;
+const SHRINK_SCALE = 0.55;
+const EFFECT_DURATION = 5;       // seconds for slow-mo / shrink
+const SLOW_FACTOR = 0.4;         // block speed multiplier while slow-mo is active
+const FONT = 'system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+
+const COLORS = {
+  player: '#22f0ff',
+  shield: '#4dff88',
+  slow:   '#3d9bff',
+  shrink: '#ffe93d',
+  text:   '#e8f6ff',
+  dim:    '#7f8aa8',
+  danger: '#ff3dcb'
+};
+// Block colors deliberately avoid the player / power-up colors so pickups stand out.
+const BLOCK_COLORS = ['#ff3dcb', '#ff8a3d', '#a66bff', '#ff4d5e'];
+
+const POWERUP_TYPES = {
+  shield: { color: COLORS.shield, label: 'SHIELD',  desc: 'Blocks 1 hit' },
+  slow:   { color: COLORS.slow,   label: 'SLOW-MO', desc: 'Slows blocks 5s' },
+  shrink: { color: COLORS.shrink, label: 'SHRINK',  desc: 'Tiny for 5s' }
+};
+
+/* =========================================================================
+   UTILITIES
+   ========================================================================= */
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const approach = (v, target, step) => (v < target ? Math.min(v + step, target) : Math.max(v - step, target));
+const pick = arr => arr[(Math.random() * arr.length) | 0];
+const rectsOverlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+function roundRect(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawText(ctx, str, x, y, size, color, opts = {}) {
+  const { align = 'center', weight = '700', glow = 0, alpha = 1, baseline = 'middle' } = opts;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align;
+  ctx.textBaseline = baseline;
+  ctx.fillStyle = color;
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow; }
+  ctx.fillText(str, x, y);
+  ctx.restore();
+}
+
+// Small vector icons for each power-up (used on pickups, HUD and start screen).
+function drawIcon(ctx, type, x, y, r, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = Math.max(1.5, r * 0.16);
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (type === 'shield') {
+    ctx.moveTo(0, -r);
+    ctx.lineTo(r * 0.8, -r * 0.6);
+    ctx.lineTo(r * 0.7, r * 0.2);
+    ctx.quadraticCurveTo(r * 0.4, r * 0.75, 0, r);
+    ctx.quadraticCurveTo(-r * 0.4, r * 0.75, -r * 0.7, r * 0.2);
+    ctx.lineTo(-r * 0.8, -r * 0.6);
+    ctx.closePath();
+    ctx.stroke();
+  } else if (type === 'slow') {
+    ctx.arc(0, 0, r * 0.85, 0, Math.PI * 2);
+    ctx.moveTo(0, 0); ctx.lineTo(0, -r * 0.55);
+    ctx.moveTo(0, 0); ctx.lineTo(r * 0.4, r * 0.1);
+    ctx.stroke();
+  } else if (type === 'shrink') {
+    ctx.setLineDash([r * 0.3, r * 0.22]);
+    ctx.strokeRect(-r * 0.8, -r * 0.8, r * 1.6, r * 1.6);
+    ctx.setLineDash([]);
+    ctx.fillRect(-r * 0.32, -r * 0.32, r * 0.64, r * 0.64);
+  }
+  ctx.restore();
+}
+
+/* =========================================================================
+   STORAGE — every access is wrapped so the game works without localStorage
+   ========================================================================= */
+const Store = {
+  get(key) {
+    try { return window.localStorage.getItem('blockDodger.' + key); } catch (e) { return null; }
+  },
+  set(key, value) {
+    try { window.localStorage.setItem('blockDodger.' + key, String(value)); } catch (e) { /* storage unavailable */ }
+  }
+};
+
+/* =========================================================================
+   SOUND — tiny synth built on the Web Audio API (no audio files)
+   ========================================================================= */
+class Sound {
+  constructor() {
+    this.ctx = null;
+    this.master = null;
+    this.noiseBuf = null;
+    this.muted = Store.get('muted') === '1';
+    this.lastTick = 0;
+  }
+
+  // Browsers require a user gesture before audio can start.
+  unlock() {
+    // Skip non-activating events (e.g. Esc) to avoid autoplay warnings.
+    if (navigator.userActivation && !navigator.userActivation.isActive) return;
+    if (!this.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      try {
+        this.ctx = new AC();
+        this.master = this.ctx.createGain();
+        this.master.gain.value = 0.5;
+        this.master.connect(this.ctx.destination);
+      } catch (e) { this.ctx = null; return; }
+    }
+    if (this.ctx.state === 'suspended') {
+      const p = this.ctx.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }
+
+  toggleMute() {
+    this.muted = !this.muted;
+    Store.set('muted', this.muted ? '1' : '0');
+    if (!this.muted) this.unlock();
+  }
+
+  get ready() { return !this.muted && this.ctx && this.ctx.state === 'running'; }
+
+  tone(freq, dur, { type = 'sine', vol = 0.2, slide = 0, delay = 0 } = {}) {
+    if (!this.ready) return;
+    const c = this.ctx, t = c.currentTime + delay;
+    const osc = c.createOscillator(), gain = c.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (slide) osc.frequency.exponentialRampToValueAtTime(slide, t + dur);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain);
+    gain.connect(this.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  }
+
+  noise(dur, vol, cutoff) {
+    if (!this.ready) return;
+    const c = this.ctx, t = c.currentTime;
+    if (!this.noiseBuf) {
+      this.noiseBuf = c.createBuffer(1, c.sampleRate, c.sampleRate);
+      const data = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = Math.random() * 2 - 1;
+    }
+    const src = c.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const filter = c.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(cutoff, t);
+    filter.frequency.exponentialRampToValueAtTime(80, t + dur);
+    const gain = c.createGain();
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.master);
+    src.start(t);
+    src.stop(t + dur + 0.05);
+  }
+
+  dodge() {
+    const now = performance.now();
+    if (now - this.lastTick < 70) return;     // throttle so bursts don't get noisy
+    this.lastTick = now;
+    this.tone(1100 + Math.random() * 400, 0.05, { type: 'square', vol: 0.03 });
+  }
+  powerup()     { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.14, { type: 'triangle', vol: 0.16, delay: i * 0.06 })); }
+  levelUp()     { this.tone(660, 0.1, { type: 'triangle', vol: 0.12 }); this.tone(990, 0.18, { type: 'triangle', vol: 0.12, delay: 0.09 }); }
+  shieldBreak() { this.noise(0.25, 0.25, 4000); this.tone(900, 0.25, { type: 'sine', vol: 0.18, slide: 250 }); }
+  hit()         { this.noise(0.5, 0.45, 1800); this.tone(180, 0.4, { type: 'sawtooth', vol: 0.2, slide: 40 }); }
+  gameOver()    { [440, 349, 294, 220].forEach((f, i) => this.tone(f, 0.28, { type: 'triangle', vol: 0.16, delay: 0.3 + i * 0.18 })); }
+}
+
+/* =========================================================================
+   PLAYER
+   ========================================================================= */
+class Player {
+  constructor() { this.reset(); }
+
+  reset() {
+    this.x = W / 2;              // horizontal center
+    this.vx = 0;
+    this.size = PLAYER_SIZE;
+    this.targetSize = PLAYER_SIZE;
+    this.shield = false;
+    this.invuln = 0;             // brief grace period after the shield pops
+    this.trail = [];
+  }
+
+  // Exact hitbox — the drawn square matches this rectangle.
+  rect() {
+    return { x: this.x - this.size / 2, y: FLOOR_Y - 6 - this.size, w: this.size, h: this.size };
+  }
+
+  /**
+   * dir: -1 / 0 / 1 from keys or buttons. targetX: finger/mouse x when dragging.
+   * Velocity eases toward the desired speed for smooth, slightly weighty movement.
+   */
+  update(dt, dir, targetX) {
+    const MAX = 560, ACCEL = 3400, DECEL = 4200;
+    let desired = dir * MAX;
+    if (dir === 0 && targetX !== null) desired = clamp((targetX - this.x) * 12, -MAX, MAX);
+    this.vx = approach(this.vx, desired, (desired === 0 ? DECEL : ACCEL) * dt);
+    this.x += this.vx * dt;
+
+    // Smoothly grow/shrink, then keep inside the screen.
+    this.size = approach(this.size, this.targetSize, 110 * dt);
+    const half = this.size / 2;
+    if (this.x < half) { this.x = half; this.vx = 0; }
+    if (this.x > W - half) { this.x = W - half; this.vx = 0; }
+
+    if (this.invuln > 0) this.invuln -= dt;
+
+    this.trail.unshift({ x: this.x, size: this.size });
+    if (this.trail.length > 7) this.trail.pop();
+  }
+
+  draw(ctx, time) {
+    const r = this.rect();
+
+    // Motion trail
+    if (Math.abs(this.vx) > 60) {
+      for (let i = 1; i < this.trail.length; i++) {
+        const t = this.trail[i];
+        ctx.globalAlpha = 0.12 * (1 - i / this.trail.length);
+        ctx.fillStyle = COLORS.player;
+        ctx.fillRect(t.x - t.size / 2, FLOOR_Y - 6 - t.size, t.size, t.size);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.save();
+    if (this.invuln > 0 && Math.floor(time * 18) % 2 === 0) ctx.globalAlpha = 0.35;
+
+    // Body with neon glow + bright core
+    ctx.shadowColor = COLORS.player;
+    ctx.shadowBlur = 22;
+    ctx.fillStyle = COLORS.player;
+    roundRect(ctx, r.x, r.y, r.w, r.h, 4);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    roundRect(ctx, r.x + r.w * 0.25, r.y + r.h * 0.25, r.w * 0.5, r.h * 0.5, 3);
+    ctx.fill();
+
+    // Shield: pulsing glowing outline
+    if (this.shield) {
+      const pulse = 0.5 + 0.5 * Math.sin(time * 6);
+      ctx.globalAlpha = 0.65 + 0.35 * pulse;
+      ctx.strokeStyle = COLORS.shield;
+      ctx.lineWidth = 3;
+      ctx.shadowColor = COLORS.shield;
+      ctx.shadowBlur = 10 + 14 * pulse;
+      roundRect(ctx, r.x - 8, r.y - 8, r.w + 16, r.h + 16, 10);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
+/* =========================================================================
+   BLOCK — falling obstacle
+   ========================================================================= */
+class Block {
+  constructor(difficulty) {
+    this.w = rand(40, 100 + 20 * difficulty);
+    this.h = rand(20, 36);
+    this.x = rand(0, W - this.w);
+    this.y = -this.h - HUD_H * 0.2;
+    const base = 190 + 270 * difficulty;          // capped: difficulty maxes at 1
+    this.speed = base * rand(0.85, 1.2);
+    this.color = pick(BLOCK_COLORS);
+  }
+
+  update(dt) { this.y += this.speed * dt; }
+
+  draw(ctx) {
+    ctx.shadowColor = this.color;
+    ctx.shadowBlur = 14;
+    ctx.fillStyle = this.color;
+    roundRect(ctx, this.x, this.y, this.w, this.h, 4);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.28)';
+    ctx.fillRect(this.x + 4, this.y + 3, this.w - 8, 3);
+  }
+}
+
+/* =========================================================================
+   POWER-UP — collectible that falls slowly
+   ========================================================================= */
+class PowerUp {
+  constructor(type) {
+    this.type = type;
+    this.r = 17;
+    this.x = rand(this.r + 10, W - this.r - 10);
+    this.y = -this.r;
+    this.speed = 150;
+    this.t = 0;
+  }
+
+  get color() { return POWERUP_TYPES[this.type].color; }
+  rect() { return { x: this.x - this.r, y: this.y - this.r, w: this.r * 2, h: this.r * 2 }; }
+  update(dt) { this.y += this.speed * dt; this.t += dt; }
+
+  draw(ctx) {
+    const pulse = 0.5 + 0.5 * Math.sin(this.t * 7);
+    ctx.save();
+    ctx.shadowColor = this.color;
+    ctx.shadowBlur = 12 + 12 * pulse;
+    ctx.strokeStyle = this.color;
+    ctx.lineWidth = 2.5;
+    ctx.fillStyle = 'rgba(10,14,32,0.85)';
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.r + pulse * 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    drawIcon(ctx, this.type, this.x, this.y, this.r * 0.55, this.color);
+    ctx.restore();
+  }
+}
+
+/* =========================================================================
+   PARTICLE & FLOATING TEXT — visual effects
+   ========================================================================= */
+class Particle {
+  constructor(x, y, color, speed) {
+    const angle = Math.random() * Math.PI * 2;
+    const v = rand(0.25, 1) * speed;
+    this.x = x; this.y = y;
+    this.vx = Math.cos(angle) * v;
+    this.vy = Math.sin(angle) * v;
+    this.life = this.maxLife = rand(0.45, 1.0);
+    this.size = rand(2, 5);
+    this.color = color;
+  }
+  update(dt) {
+    const drag = Math.pow(0.08, dt);
+    this.vx *= drag; this.vy *= drag;
+    this.vy += 220 * dt;
+    this.x += this.vx * dt; this.y += this.vy * dt;
+    this.life -= dt;
+  }
+  draw(ctx) {
+    ctx.globalAlpha = Math.max(0, this.life / this.maxLife);
+    ctx.fillStyle = this.color;
+    const s = this.size * (0.5 + 0.5 * this.life / this.maxLife);
+    ctx.fillRect(this.x - s / 2, this.y - s / 2, s, s);
+  }
+}
+
+class FloatText {
+  constructor(text, x, y, color) {
+    this.text = text; this.x = x; this.y = y; this.color = color; this.life = 1.1;
+  }
+  update(dt) { this.y -= 45 * dt; this.life -= dt; }
+  draw(ctx) { drawText(ctx, this.text, this.x, this.y, 20, this.color, { glow: 12, alpha: clamp(this.life, 0, 1) }); }
+}
+
+/* =========================================================================
+   GAME — state machine, spawning, collisions, rendering, input
+   ========================================================================= */
+class Game {
+  constructor() {
+    this.canvas = document.getElementById('game');
+    this.ctx = this.canvas.getContext('2d');
+    this.wrap = document.getElementById('wrap');
+    this.sound = new Sound();
+    this.player = new Player();
+
+    this.state = 'start';        // 'start' | 'playing' | 'paused' | 'over'
+    this.best = parseInt(Store.get('best'), 10) || 0;
+    this.time = 0;               // global animation clock
+    this.bgOffset = 0;
+    this.shake = 0;
+    this.flash = 0;
+    this.input = { left: false, right: false, btnLeft: false, btnRight: false, targetX: null, pointerId: null };
+
+    this.resetWorld();
+    this.bindInput();
+    this.resize();
+    this.updateButtons();
+
+    this.last = performance.now();
+    this.loop = this.loop.bind(this);
+    requestAnimationFrame(this.loop);
+  }
+
+  resetWorld() {
+    this.blocks = [];
+    this.powerups = [];
+    this.particles = [];
+    this.floatTexts = [];
+    this.effects = { slow: 0, shrink: 0 };
+    this.score = 0;
+    this.elapsed = 0;
+    this.level = 1;
+    this.dodged = 0;
+    this.spawnTimer = 0.6;
+    this.powerTimer = rand(6, 9);
+    this.banner = null;
+    this.player.reset();
+  }
+
+  /* ---------- State transitions ---------- */
+  start() {
+    this.sound.unlock();
+    this.resetWorld();
+    this.state = 'playing';
+    this.updateButtons();
+  }
+
+  pause() {
+    if (this.state !== 'playing') return;
+    this.state = 'paused';
+    this.clearInput();
+    this.updateButtons();
+  }
+
+  resume() {
+    if (this.state !== 'paused') return;
+    this.state = 'playing';
+    this.last = performance.now();
+    this.updateButtons();
+  }
+
+  togglePause() {
+    if (this.state === 'playing') this.pause();
+    else if (this.state === 'paused') this.resume();
+  }
+
+  gameOver(block) {
+    const r = this.player.rect();
+    this.state = 'over';
+    this.overTimer = 0;
+    this.shake = 0.6;
+    this.flash = 0.45;
+    this.burst(r.x + r.w / 2, r.y + r.h / 2, COLORS.player, 60, 480);
+    this.burst(block.x + block.w / 2, block.y + block.h / 2, block.color, 30, 360);
+    this.sound.hit();
+    this.sound.gameOver();
+
+    this.finalScore = Math.floor(this.score);
+    this.newHigh = this.finalScore > this.best;
+    if (this.newHigh) {
+      this.best = this.finalScore;
+      Store.set('best', this.best);
+    }
+    this.clearInput();
+    this.updateButtons();
+  }
+
+  // Space / tap: context-sensitive "primary action".
+  primaryAction() {
+    if (this.state === 'start') this.start();
+    else if (this.state === 'paused') this.resume();
+    else if (this.state === 'over' && this.overTimer > 0.6) this.start();
+  }
+
+  /* ---------- Spawning & effects ---------- */
+  burst(x, y, color, count, speed) {
+    for (let i = 0; i < count; i++) this.particles.push(new Particle(x, y, color, speed));
+    if (this.particles.length > 500) this.particles.splice(0, this.particles.length - 500);
+  }
+
+  collect(p) {
+    const info = POWERUP_TYPES[p.type];
+    if (p.type === 'shield') this.player.shield = true;
+    else if (p.type === 'slow') this.effects.slow = EFFECT_DURATION;
+    else if (p.type === 'shrink') this.effects.shrink = EFFECT_DURATION;
+    this.score += 25;
+    this.burst(p.x, p.y, info.color, 36, 320);
+    const r = this.player.rect();
+    this.floatTexts.push(new FloatText(info.label + '!', clamp(r.x + r.w / 2, 70, W - 70), r.y - 24, info.color));
+    this.sound.powerup();
+  }
+
+  /* ---------- Update ---------- */
+  update(dt) {
+    this.time += dt;
+
+    if (this.state === 'playing') this.updatePlaying(dt);
+    else if (this.state === 'start' || this.state === 'over') this.updateAmbient(dt);
+
+    if (this.state !== 'paused') {
+      const slowF = this.state === 'playing' && this.effects.slow > 0 ? SLOW_FACTOR : 1;
+      this.bgOffset += dt * (30 + 90 * this.difficulty()) * slowF;
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        this.particles[i].update(dt);
+        if (this.particles[i].life <= 0) this.particles.splice(i, 1);
+      }
+      for (let i = this.floatTexts.length - 1; i >= 0; i--) {
+        this.floatTexts[i].update(dt);
+        if (this.floatTexts[i].life <= 0) this.floatTexts.splice(i, 1);
+      }
+      this.shake = Math.max(0, this.shake - dt);
+      this.flash = Math.max(0, this.flash - dt);
+      if (this.banner) { this.banner.t -= dt; if (this.banner.t <= 0) this.banner = null; }
+    }
+  }
+
+  // Difficulty ramps 0 -> 1 over ~2¼ minutes, then stays capped so the game stays winnable.
+  difficulty() { return this.state === 'playing' || this.state === 'paused' ? Math.min(this.elapsed / 135, 1) : 0; }
+
+  updatePlaying(dt) {
+    const e = this.effects;
+    this.elapsed += dt;
+    const diff = this.difficulty();
+
+    const newLevel = Math.min(10, 1 + Math.floor(this.elapsed / 15));
+    if (newLevel > this.level) {
+      this.level = newLevel;
+      this.banner = { text: newLevel === 10 ? 'MAX LEVEL' : 'LEVEL ' + newLevel, t: 1.4 };
+      this.sound.levelUp();
+    }
+
+    // Timed effects
+    e.slow = Math.max(0, e.slow - dt);
+    e.shrink = Math.max(0, e.shrink - dt);
+    this.player.targetSize = e.shrink > 0 ? PLAYER_SIZE * SHRINK_SCALE : PLAYER_SIZE;
+    const slowF = e.slow > 0 ? SLOW_FACTOR : 1;
+
+    // Player movement (keys/buttons take priority over drag)
+    const inp = this.input;
+    const dir = ((inp.right || inp.btnRight) ? 1 : 0) - ((inp.left || inp.btnLeft) ? 1 : 0);
+    this.player.update(dt, dir, inp.targetX);
+
+    // Spawn blocks (spawn rate is slowed along with blocks during slow-mo)
+    this.spawnTimer -= dt * slowF;
+    if (this.spawnTimer <= 0) {
+      this.blocks.push(new Block(diff));
+      this.spawnTimer = rand(0.8, 1.2) * (0.9 - 0.52 * diff);
+    }
+
+    // Blocks: move, count dodges, check collisions
+    const pr = this.player.rect();
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      const b = this.blocks[i];
+      b.update(dt * slowF);
+      if (b.y >= FLOOR_Y) {
+        this.blocks.splice(i, 1);
+        this.score += 5;
+        this.dodged++;
+        this.sound.dodge();
+        continue;
+      }
+      if (this.player.invuln <= 0 && rectsOverlap(pr, b)) {
+        if (this.player.shield) {
+          this.player.shield = false;
+          this.player.invuln = 1;
+          this.burst(b.x + b.w / 2, b.y + b.h / 2, b.color, 26, 340);
+          this.burst(pr.x + pr.w / 2, pr.y + pr.h / 2, COLORS.shield, 24, 300);
+          this.blocks.splice(i, 1);
+          this.shake = 0.2;
+          this.sound.shieldBreak();
+          continue;
+        }
+        this.gameOver(b);
+        return;
+      }
+    }
+
+    // Power-ups
+    this.powerTimer -= dt;
+    if (this.powerTimer <= 0) {
+      this.powerups.push(new PowerUp(pick(Object.keys(POWERUP_TYPES))));
+      this.powerTimer = rand(7, 12);
+    }
+    for (let i = this.powerups.length - 1; i >= 0; i--) {
+      const p = this.powerups[i];
+      p.update(dt);
+      if (p.y - p.r > FLOOR_Y) { this.powerups.splice(i, 1); continue; }
+      if (rectsOverlap(pr, p.rect())) { this.collect(p); this.powerups.splice(i, 1); }
+    }
+
+    // Time-survived points
+    this.score += dt * 10;
+  }
+
+  // Background motion on the start / game-over screens.
+  updateAmbient(dt) {
+    if (this.state === 'over') this.overTimer += dt;
+    this.spawnTimer -= dt;
+    if (this.spawnTimer <= 0) {
+      this.blocks.push(new Block(0));
+      this.spawnTimer = rand(0.5, 0.9);
+    }
+    for (let i = this.blocks.length - 1; i >= 0; i--) {
+      this.blocks[i].update(dt * 0.6);
+      if (this.blocks[i].y >= FLOOR_Y) this.blocks.splice(i, 1);
+    }
+    for (let i = this.powerups.length - 1; i >= 0; i--) {
+      this.powerups[i].update(dt);
+      if (this.powerups[i].y - this.powerups[i].r > FLOOR_Y) this.powerups.splice(i, 1);
+    }
+  }
+
+  /* ---------- Rendering ---------- */
+  draw() {
+    const ctx = this.ctx;
+    ctx.setTransform(this.renderScale, 0, 0, this.renderScale, 0, 0);
+
+    ctx.save();
+    if (this.shake > 0) {
+      const m = 16 * (this.shake / 0.6);
+      ctx.translate(rand(-m, m), rand(-m, m));
+    }
+    this.drawBackground(ctx);
+    for (const b of this.blocks) b.draw(ctx);
+    ctx.shadowBlur = 0;
+    for (const p of this.powerups) p.draw(ctx);
+    if (this.state === 'playing' || this.state === 'paused') this.player.draw(ctx, this.time);
+
+    ctx.globalCompositeOperation = 'lighter';
+    for (const p of this.particles) p.draw(ctx);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    for (const f of this.floatTexts) f.draw(ctx);
+    this.drawFloor(ctx);
+    ctx.restore();
+
+    // Slow-mo tint
+    if (this.state === 'playing' && this.effects.slow > 0) {
+      ctx.fillStyle = 'rgba(61,155,255,0.07)';
+      ctx.fillRect(0, 0, W, H);
+    }
+    if (this.flash > 0) {
+      ctx.fillStyle = `rgba(255,80,160,${this.flash * 0.6})`;
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    if (this.state !== 'start') this.drawHUD(ctx);
+    if (this.state === 'playing') {
+      this.drawEffects(ctx);
+      if (this.banner) {
+        const a = Math.min(1, this.banner.t / 0.4);
+        drawText(ctx, this.banner.text, W / 2, 300, 44, COLORS.shrink, { glow: 20, alpha: a });
+      }
+    }
+
+    if (this.state === 'start') this.drawStartScreen(ctx);
+    else if (this.state === 'paused') this.drawPauseScreen(ctx);
+    else if (this.state === 'over') this.drawGameOverScreen(ctx);
+  }
+
+  drawBackground(ctx) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#070716');
+    g.addColorStop(1, '#10061f');
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+
+    // Scrolling neon grid
+    const s = 40, off = this.bgOffset % s;
+    ctx.strokeStyle = 'rgba(90,110,255,0.07)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += s) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+    for (let y = off - s; y <= H; y += s) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+    ctx.stroke();
+  }
+
+  drawFloor(ctx) {
+    const g = ctx.createLinearGradient(0, FLOOR_Y, 0, H);
+    g.addColorStop(0, '#0d0a24');
+    g.addColorStop(1, '#06050f');
+    ctx.fillStyle = g;
+    ctx.fillRect(-20, FLOOR_Y, W + 40, H - FLOOR_Y + 20);
+    ctx.save();
+    ctx.strokeStyle = COLORS.player;
+    ctx.globalAlpha = 0.6;
+    ctx.shadowColor = COLORS.player;
+    ctx.shadowBlur = 12;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, FLOOR_Y);
+    ctx.lineTo(W, FLOOR_Y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  drawHUD(ctx) {
+    ctx.fillStyle = 'rgba(5,5,16,0.78)';
+    ctx.fillRect(0, 0, W, HUD_H);
+    ctx.fillStyle = 'rgba(34,240,255,0.25)';
+    ctx.fillRect(0, HUD_H - 1, W, 1);
+
+    const score = this.state === 'over' ? this.finalScore : Math.floor(this.score);
+    const cols = [
+      { x: 18,  label: 'SCORE', value: score,      color: COLORS.player },
+      { x: 175, label: 'BEST',  value: this.best,  color: COLORS.danger },
+      { x: 330, label: 'LEVEL', value: this.level, color: COLORS.shrink }
+    ];
+    for (const c of cols) {
+      drawText(ctx, c.label, c.x, 17, 11, COLORS.dim, { align: 'left', weight: '600' });
+      drawText(ctx, String(c.value), c.x, 38, 22, c.color, { align: 'left', weight: '800', glow: 8 });
+    }
+  }
+
+  // Active power-up pills with countdown bars.
+  drawEffects(ctx) {
+    const items = [];
+    if (this.player.shield) items.push({ type: 'shield', text: 'READY', frac: 1 });
+    if (this.effects.slow > 0) items.push({ type: 'slow', text: this.effects.slow.toFixed(1) + 's', frac: this.effects.slow / EFFECT_DURATION });
+    if (this.effects.shrink > 0) items.push({ type: 'shrink', text: this.effects.shrink.toFixed(1) + 's', frac: this.effects.shrink / EFFECT_DURATION });
+
+    items.forEach((it, i) => {
+      const color = POWERUP_TYPES[it.type].color;
+      const x = 12 + i * 148, y = HUD_H + 10, w = 138, h = 32;
+      // Blink during the final second
+      const blink = it.frac < 0.2 && Math.floor(this.time * 8) % 2 === 0 ? 0.45 : 1;
+      ctx.save();
+      ctx.globalAlpha = blink;
+      ctx.fillStyle = 'rgba(8,10,26,0.85)';
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
+      roundRect(ctx, x, y, w, h, 8);
+      ctx.fill();
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+      drawIcon(ctx, it.type, x + 17, y + 14, 8, color);
+      drawText(ctx, POWERUP_TYPES[it.type].label, x + 32, y + 14, 12, color, { align: 'left', weight: '700' });
+      drawText(ctx, it.text, x + w - 9, y + 14, 12, COLORS.text, { align: 'right', weight: '700' });
+      ctx.fillStyle = color;
+      ctx.fillRect(x + 8, y + h - 6, (w - 16) * it.frac, 2.5);
+      ctx.restore();
+    });
+  }
+
+  dim(ctx, alpha) {
+    ctx.fillStyle = `rgba(4,4,12,${alpha})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  drawStartScreen(ctx) {
+    this.dim(ctx, 0.62);
+    const bob = Math.sin(this.time * 2) * 4;
+    drawText(ctx, 'BLOCK', W / 2, 170 + bob, 78, COLORS.player, { weight: '900', glow: 28 });
+    drawText(ctx, 'DODGER', W / 2, 245 + bob, 78, COLORS.danger, { weight: '900', glow: 28 });
+    drawText(ctx, 'Dodge the falling blocks. Survive as long as you can.', W / 2, 305, 16, COLORS.dim, { weight: '500' });
+
+    // Controls panel
+    ctx.fillStyle = 'rgba(12,16,40,0.8)';
+    ctx.strokeStyle = 'rgba(34,240,255,0.3)';
+    ctx.lineWidth = 1;
+    roundRect(ctx, 90, 335, 420, 142, 12);
+    ctx.fill(); ctx.stroke();
+    const rows = [
+      ['MOVE', '← →  or  A / D'],
+      ['TOUCH', 'Drag, or hold ◀ ▶ buttons'],
+      ['PAUSE', 'P / Esc'],
+      ['MUTE', 'M']
+    ];
+    rows.forEach(([k, v], i) => {
+      const y = 364 + i * 29;
+      drawText(ctx, k, 118, y, 13, COLORS.dim, { align: 'left', weight: '700' });
+      drawText(ctx, v, 482, y, 16, COLORS.text, { align: 'right', weight: '600' });
+    });
+
+    // Power-up legend
+    Object.keys(POWERUP_TYPES).forEach((type, i) => {
+      const info = POWERUP_TYPES[type];
+      const x = 160 + i * 140, y = 525;
+      ctx.save();
+      ctx.shadowColor = info.color; ctx.shadowBlur = 12;
+      ctx.strokeStyle = info.color; ctx.lineWidth = 2;
+      ctx.fillStyle = 'rgba(10,14,32,0.9)';
+      ctx.beginPath(); ctx.arc(x, y, 17, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+      ctx.restore();
+      drawIcon(ctx, type, x, y, 9, info.color);
+      drawText(ctx, info.label, x, y + 34, 13, info.color, { weight: '800' });
+      drawText(ctx, info.desc, x, y + 53, 12, COLORS.dim, { weight: '500' });
+    });
+
+    const pulse = 0.55 + 0.45 * Math.sin(this.time * 4);
+    drawText(ctx, 'Press Space / Tap to Start', W / 2, 648, 26, COLORS.text, { weight: '800', glow: 14, alpha: pulse });
+    if (this.best > 0) drawText(ctx, 'BEST  ' + this.best, W / 2, 688, 16, COLORS.danger, { weight: '700', glow: 8 });
+  }
+
+  drawPauseScreen(ctx) {
+    this.dim(ctx, 0.6);
+    drawText(ctx, 'PAUSED', W / 2, 350, 68, COLORS.player, { weight: '900', glow: 26 });
+    const pulse = 0.55 + 0.45 * Math.sin(this.time * 4);
+    drawText(ctx, 'Press P / Esc / Space or tap to resume', W / 2, 420, 18, COLORS.text, { weight: '600', alpha: pulse });
+    drawText(ctx, 'M to toggle sound', W / 2, 452, 14, COLORS.dim, { weight: '500' });
+  }
+
+  drawGameOverScreen(ctx) {
+    const a = Math.min(1, this.overTimer / 0.5);
+    ctx.save();
+    ctx.globalAlpha = a;
+    this.dim(ctx, 0.66);
+    drawText(ctx, 'GAME OVER', W / 2, 240, 66, COLORS.danger, { weight: '900', glow: 28 });
+    drawText(ctx, 'SCORE', W / 2, 320, 14, COLORS.dim, { weight: '700' });
+    drawText(ctx, String(this.finalScore), W / 2, 368, 60, COLORS.player, { weight: '900', glow: 20 });
+    drawText(ctx, 'BEST', W / 2, 425, 14, COLORS.dim, { weight: '700' });
+    drawText(ctx, String(this.best), W / 2, 456, 30, COLORS.text, { weight: '800' });
+    if (this.newHigh) {
+      const s = 1 + 0.06 * Math.sin(this.time * 8);
+      ctx.save();
+      ctx.translate(W / 2, 515);
+      ctx.scale(s, s);
+      drawText(ctx, 'NEW HIGH SCORE!', 0, 0, 30, COLORS.shrink, { weight: '900', glow: 22 });
+      ctx.restore();
+    }
+    drawText(ctx, `Dodged ${this.dodged} blocks  ·  Level ${this.level}`, W / 2, 565, 16, COLORS.dim, { weight: '500' });
+    if (this.overTimer > 0.6) {
+      const pulse = 0.55 + 0.45 * Math.sin(this.time * 4);
+      drawText(ctx, 'Press Space / Tap to Restart', W / 2, 630, 24, COLORS.text, { weight: '800', glow: 12, alpha: pulse });
+    }
+    ctx.restore();
+  }
+
+  /* ---------- Main loop (delta-time based) ---------- */
+  loop(now) {
+    const dt = Math.min(Math.max((now - this.last) / 1000, 0), 0.05);   // clamp to avoid huge jumps
+    this.last = now;
+    this.update(dt);
+    this.draw();
+    requestAnimationFrame(this.loop);
+  }
+
+  /* ---------- Layout ---------- */
+  resize() {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const scale = Math.min(vw / W, vh / H);
+    const cssW = Math.floor(W * scale), cssH = Math.floor(H * scale);
+    const dpr = Math.min(window.devicePixelRatio || 1, 3);
+    this.wrap.style.width = cssW + 'px';
+    this.wrap.style.height = cssH + 'px';
+    this.canvas.width = Math.round(cssW * dpr);
+    this.canvas.height = Math.round(cssH * dpr);
+    this.renderScale = this.canvas.width / W;
+    document.documentElement.style.setProperty('--u', (cssW / W) + 'px');
+  }
+
+  /* ---------- UI buttons ---------- */
+  updateButtons() {
+    const pauseBtn = document.getElementById('pauseBtn');
+    const muteBtn = document.getElementById('muteBtn');
+    pauseBtn.classList.toggle('hidden', !(this.state === 'playing' || this.state === 'paused'));
+    pauseBtn.innerHTML = this.state === 'paused'
+      ? '<svg viewBox="0 0 24 24"><path d="M8 5 L19 12 L8 19 Z"/></svg>'
+      : '<svg viewBox="0 0 24 24"><path d="M9 5 V19 M15 5 V19"/></svg>';
+    pauseBtn.setAttribute('aria-label', this.state === 'paused' ? 'Resume' : 'Pause');
+    muteBtn.innerHTML = this.sound.muted
+      ? '<svg viewBox="0 0 24 24"><path d="M4 9 H8 L13 5 V19 L8 15 H4 Z"/><path d="M17 9 L22 14 M22 9 L17 14"/></svg>'
+      : '<svg viewBox="0 0 24 24"><path d="M4 9 H8 L13 5 V19 L8 15 H4 Z"/><path d="M16.5 8.5 Q19 12 16.5 15.5 M19 6 Q23.5 12 19 18"/></svg>';
+    muteBtn.style.opacity = this.sound.muted ? '0.6' : '1';
+  }
+
+  clearInput() {
+    const i = this.input;
+    i.left = i.right = i.btnLeft = i.btnRight = false;
+    i.targetX = null;
+    i.pointerId = null;
+    document.getElementById('leftBtn').classList.remove('active');
+    document.getElementById('rightBtn').classList.remove('active');
+  }
+
+  toWorldX(e) {
+    const r = this.canvas.getBoundingClientRect();
+    return ((e.clientX - r.left) / r.width) * W;
+  }
+
+  /* ---------- Input ---------- */
+  bindInput() {
+    const inp = this.input;
+
+    // Show on-screen buttons on touch devices
+    const markTouch = () => this.wrap.classList.add('touch');
+    if (('ontouchstart' in window) || navigator.maxTouchPoints > 0 ||
+        (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)) markTouch();
+
+    // Keyboard
+    window.addEventListener('keydown', e => {
+      const k = e.key;
+      if (k === ' ' || k === 'Spacebar' || k.startsWith('Arrow')) e.preventDefault();
+      this.sound.unlock();
+      switch (k) {
+        case 'ArrowLeft': case 'a': case 'A': inp.left = true; break;
+        case 'ArrowRight': case 'd': case 'D': inp.right = true; break;
+        case ' ': case 'Spacebar': case 'Enter':
+          if (!e.repeat) this.primaryAction();
+          break;
+        case 'p': case 'P': case 'Escape':
+          if (!e.repeat) this.togglePause();
+          break;
+        case 'm': case 'M':
+          if (!e.repeat) { this.sound.toggleMute(); this.updateButtons(); }
+          break;
+      }
+    });
+    window.addEventListener('keyup', e => {
+      const k = e.key;
+      if (k === ' ' || k === 'Spacebar') e.preventDefault();
+      if (k === 'ArrowLeft' || k === 'a' || k === 'A') inp.left = false;
+      if (k === 'ArrowRight' || k === 'd' || k === 'D') inp.right = false;
+    });
+
+    // Canvas pointer: tap to start/resume/restart, drag to move
+    const c = this.canvas;
+    c.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      if (e.pointerType === 'touch') markTouch();
+      this.sound.unlock();
+      if (this.state !== 'playing') { this.primaryAction(); return; }
+      inp.pointerId = e.pointerId;
+      inp.targetX = this.toWorldX(e);
+      try { c.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+    });
+    c.addEventListener('pointermove', e => {
+      if (e.pointerId === inp.pointerId && this.state === 'playing') inp.targetX = this.toWorldX(e);
+    });
+    const endDrag = e => {
+      if (e.pointerId === inp.pointerId) { inp.pointerId = null; inp.targetX = null; }
+    };
+    c.addEventListener('pointerup', endDrag);
+    c.addEventListener('pointercancel', endDrag);
+
+    // On-screen hold buttons
+    const hold = (id, key) => {
+      const el = document.getElementById(id);
+      const on = e => {
+        e.preventDefault();
+        this.sound.unlock();
+        if (this.state !== 'playing') { this.primaryAction(); return; }
+        inp[key] = true;
+        el.classList.add('active');
+      };
+      const off = () => { inp[key] = false; el.classList.remove('active'); };
+      el.addEventListener('pointerdown', on);
+      el.addEventListener('pointerup', off);
+      el.addEventListener('pointerleave', off);
+      el.addEventListener('pointercancel', off);
+    };
+    hold('leftBtn', 'btnLeft');
+    hold('rightBtn', 'btnRight');
+
+    // Pause & mute buttons
+    const pauseBtn = document.getElementById('pauseBtn');
+    const muteBtn = document.getElementById('muteBtn');
+    pauseBtn.addEventListener('pointerdown', e => e.preventDefault());
+    muteBtn.addEventListener('pointerdown', e => e.preventDefault());
+    pauseBtn.addEventListener('click', () => { this.sound.unlock(); this.togglePause(); pauseBtn.blur(); });
+    muteBtn.addEventListener('click', () => { this.sound.toggleMute(); this.updateButtons(); muteBtn.blur(); });
+
+    // Auto-pause when the tab/window loses focus
+    window.addEventListener('blur', () => { this.pause(); this.clearInput(); });
+    document.addEventListener('visibilitychange', () => { if (document.hidden) { this.pause(); this.clearInput(); } });
+
+    // Layout
+    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('orientationchange', () => this.resize());
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', () => this.resize());
+
+    window.addEventListener('contextmenu', e => e.preventDefault());
+  }
+}
+
+/* =========================================================================
+   BOOT
+   ========================================================================= */
+window.addEventListener('DOMContentLoaded', () => { new Game(); });
+</script>
+</body>
+</html>
